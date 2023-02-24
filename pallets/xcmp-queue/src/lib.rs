@@ -619,15 +619,23 @@ impl<T: Config> Pallet<T> {
 
 	fn handle_xcm_message(
 		sender: ParaId,
-		_sent_at: RelayBlockNumber,
-		xcm: VersionedXcm<T::RuntimeCall>,
+		sent_at: RelayBlockNumber,
+		versioned_xcm: VersionedXcm<T::RuntimeCall>,
 		max_weight: Weight,
+		was_defered: bool,
 	) -> Result<Weight, XcmError> {
 		let hash = Encode::using_encoded(&xcm, T::Hashing::hash);
 		log::debug!("Processing XCMP-XCM: {:?}", &hash);
-		let (result, event) = match Xcm::<T::RuntimeCall>::try_from(xcm) {
+		let (result, event) = match Xcm::<T::RuntimeCall>::try_from(versioned_xcm.clone()) {
 			Ok(xcm) => {
 				let location = (1, Parachain(sender.into()));
+
+				if !was_defered && if let Some(incoming_assets) = Self::extract_assets(xcm) {
+					let new_volume = VolumePerAsset::get(asset.id).saturating_add(get_volume(asset));
+					if new_volume > MAX_VOLUME_PER_ASSET {
+						DeferedQueue::mutate(|queue| queue.push((sender, sent_at, versioned_xcm, max_weight)));
+					}
+				}
 
 				match T::XcmExecutor::execute_xcm(location, xcm, max_weight.ref_time()) {
 					Outcome::Error(e) => (
@@ -679,7 +687,16 @@ impl<T: Config> Pallet<T> {
 						&mut remaining_fragments,
 					) {
 						let weight = max_weight - weight_used;
-						match Self::handle_xcm_message(sender, sent_at, xcm, weight) {
+
+						let defered_queue = DeferedQueue::get(sent_at);
+						let (sender, sent_at, xcm, weight, was_defered) = if !defered_queue.empty() {
+							let (s, at, x, w) = defered_queue.pop();
+							(s, at, x, w, true)
+						} else {
+							(sender, sent_at, xcm, weight, false)
+						};
+
+						match Self::handle_xcm_message(sender, sent_at, xcm, weight, was_defered) {
 							Ok(used) => weight_used = weight_used.saturating_add(used),
 							Err(XcmError::WeightLimitReached(required))
 								if required > max_individual_weight.ref_time() =>
